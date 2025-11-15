@@ -49,10 +49,10 @@ class ScalpingSignal:
 class GoldScalpingStrategy:
     """OPTIMIZED Gold Scalping Strategy - MAX 10 TRADES/DAY"""
     
-    def __init__(self):
+    def __init__(self, instrument: Optional[str] = None):
         """Initialize optimized strategy"""
         self.name = "Gold Scalping - Optimized"
-        self.instruments = ['XAU_USD']
+        self.instruments = [instrument] if instrument else ['XAU_USD']
         
         # ===============================================
         # BALANCED STRATEGY PARAMETERS (OPTIMIZED OCT 23, 2025)
@@ -79,6 +79,7 @@ class GoldScalpingStrategy:
         self.daily_trade_ranking = True      # Rank and select best
         self.require_multiple_confirmations = True
         self.min_confirmations = 2           # REDUCED: 2 confirmations (was 3 - too strict)
+        self._base_min_confirmations = self.min_confirmations
         
         # ===============================================
         # ENHANCED ENTRY CONDITIONS
@@ -90,6 +91,7 @@ class GoldScalpingStrategy:
         self.ny_session_end = 21             # 21:00 UTC
         self.min_time_between_trades_minutes = 45  # Space out trades more
         self.require_pullback = True         # WAIT for pullback (don't chase)
+        self._base_require_pullback = self.require_pullback
         self.pullback_ema_period = 21        # Must pull back to 21 EMA
         self.pullback_threshold = 0.0003     # 0.03% pullback required
         
@@ -98,6 +100,7 @@ class GoldScalpingStrategy:
         # ===============================================
         self.breakout_lookback = 15          # Look back 15 periods
         self.breakout_threshold = 0.005      # 0.5% move - VERY STRONG only
+        self._base_breakout_threshold = self.breakout_threshold
         self.require_volume_spike = True     # Volume confirmation required
         self.volume_spike_multiplier = 2.0   # 2x average volume
         
@@ -117,6 +120,13 @@ class GoldScalpingStrategy:
         self.signals: List[TradeSignal] = []
         self.daily_signals = []  # Store all signals for ranking
         self.selected_trades = []  # Quality trades selected
+        self.allowed_killzones: Optional[set] = None
+        self.directional_bias: str = 'both'
+        self.trend_filter_enabled: bool = False
+        self.trend_filter_fast_period: int = 21
+        self.trend_filter_slow_period: int = 55
+        self.trend_filter_buffer: float = 0.0
+        self.pip_size: float = 0.0001
         
         # ===============================================
         # PERFORMANCE TRACKING
@@ -124,6 +134,16 @@ class GoldScalpingStrategy:
         self.daily_trade_count = 0
         self.last_reset_date = datetime.now().date()
         self.last_trade_time = None  # Track time between trades
+        self.current_timestamp: Optional[datetime] = None
+        self.current_killzone: Optional[str] = None
+        self.backtest_mode = False
+        self.backtest_spread_multiplier = 1.0
+        self.backtest_threshold_multiplier = 1.0
+        self.adaptive_min_volatility: Optional[float] = None
+        self.adaptive_min_atr: Optional[float] = None
+        self.news_mode: str = 'block'  # 'block', 'penalize', 'off'
+        self.news_penalty_factor: float = 0.5
+        self.last_skip_reason: Optional[str] = None
         
         # ===============================================
         # NEWS INTEGRATION
@@ -133,6 +153,8 @@ class GoldScalpingStrategy:
             logger.info("✅ News integration enabled for quality filtering")
         else:
             logger.info("ℹ️  Trading without news integration (technical signals only)")
+        self.news_guard_enabled = True
+        self.news_sentiment_scale = 0.15
         
         # ===============================================
         # LEARNING & HONESTY SYSTEM (NEW OCT 21, 2025)
@@ -162,6 +184,53 @@ class GoldScalpingStrategy:
         logger.info(f"📊 Max trades/day: {self.max_trades_per_day}")
         logger.info(f"📊 R:R ratio: 1:{self.take_profit_pips/self.stop_loss_pips:.1f}")
     
+    def enable_backtest_mode(
+        self,
+        spread_multiplier: float = 1.0,
+        threshold_multiplier: float = 1.0,
+        breakout_multiplier: float = 1.0,
+        disable_pullback: bool = False,
+        min_time_between_trades_minutes: Optional[int] = None,
+        min_confirmations: Optional[int] = None,
+        adaptive_min_volatility: Optional[float] = None,
+        adaptive_min_atr: Optional[float] = None,
+        max_trades_per_day: Optional[int] = None,
+    ):
+        """Relax strict real-time guards to support historical replays."""
+        self.backtest_mode = True
+        self.backtest_spread_multiplier = max(1.0, spread_multiplier)
+        self.backtest_threshold_multiplier = max(0.1, min(1.0, threshold_multiplier))
+        breakout_multiplier = max(0.05, breakout_multiplier)
+        self.breakout_threshold = max(
+            0.0001, self._base_breakout_threshold * breakout_multiplier
+        )
+        if disable_pullback:
+            self.require_pullback = False
+        if min_time_between_trades_minutes is not None:
+            self.min_time_between_trades_minutes = max(0, min_time_between_trades_minutes)
+        if min_confirmations is not None:
+            self.min_confirmations = max(1, min_confirmations)
+        if adaptive_min_volatility is not None or adaptive_min_atr is not None:
+            self.set_adaptive_thresholds(adaptive_min_volatility, adaptive_min_atr)
+        else:
+            self.set_adaptive_thresholds()
+        if max_trades_per_day is not None:
+            self.max_trades_per_day = max(1, max_trades_per_day)
+        self.news_enabled = False
+        logger.info(
+            "🧪 Backtest mode ENABLED "
+            f"(spread x{self.backtest_spread_multiplier:.1f}, "
+            f"threshold x{self.backtest_threshold_multiplier:.2f}, "
+            f"breakout x{breakout_multiplier:.2f}, "
+            f"pullback={'OFF' if not self.require_pullback else 'ON'}, "
+            f"min_conf={self.min_confirmations})"
+        )
+    
+    def set_adaptive_thresholds(self, min_volatility: Optional[float] = None, min_atr: Optional[float] = None):
+        """Configure dynamic threshold overrides."""
+        self.adaptive_min_volatility = min_volatility
+        self.adaptive_min_atr = min_atr
+    
     @property
     def daily_trades(self):
         """Get daily trade count"""
@@ -169,7 +238,10 @@ class GoldScalpingStrategy:
     
     def _reset_daily_counters(self):
         """Reset daily counters if new day"""
-        current_date = datetime.now().date()
+        if self.backtest_mode and self.current_timestamp:
+            current_date = self.current_timestamp.date()
+        else:
+            current_date = datetime.now().date()
         if current_date != self.last_reset_date:
             self.daily_trade_count = 0
             self.last_reset_date = current_date
@@ -179,7 +251,10 @@ class GoldScalpingStrategy:
     
     def _is_london_or_ny_session(self) -> bool:
         """Check if current time is London or NY session"""
-        now = datetime.now()
+        if self.backtest_mode and self.current_timestamp:
+            now = self.current_timestamp
+        else:
+            now = datetime.now()
         current_hour = now.hour
         
         # London session: 07:00-16:00 UTC
@@ -192,6 +267,8 @@ class GoldScalpingStrategy:
     
     def _can_trade_now(self) -> bool:
         """Check if enough time has passed since last trade"""
+        if self.backtest_mode:
+            return True
         if self.last_trade_time is None:
             return True
         
@@ -281,108 +358,260 @@ class GoldScalpingStrategy:
                 if len(self.price_history[instrument]) > 100:
                     self.price_history[instrument] = self.price_history[instrument][-100:]
     
+    def _set_current_timestamp(self, market_data: Dict[str, MarketData]):
+        """Track the timestamp associated with the latest candle (for backtests)."""
+        self.current_timestamp = None
+        self.current_killzone = None
+        if not market_data:
+            return
+        sample = next(iter(market_data.values()))
+        ts = getattr(sample, "timestamp", None)
+        if isinstance(ts, datetime):
+            self.current_timestamp = ts
+        elif isinstance(ts, str):
+            try:
+                self.current_timestamp = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+            except Exception:
+                self.current_timestamp = None
+        else:
+            self.current_timestamp = None
+        if self.current_timestamp:
+            self.current_killzone = self._infer_killzone(self.current_timestamp)
+    
+    def _infer_killzone(self, timestamp: datetime) -> str:
+        hour = timestamp.hour
+        if 0 <= hour < 6:
+            return 'asia_open'
+        if 6 <= hour < 11:
+            return 'london_open'
+        if 11 <= hour < 16:
+            return 'london_ny_overlap'
+        if 16 <= hour < 22:
+            return 'ny_afternoon'
+        return 'off_session'
+    
+    def _killzone_allows_trade(self) -> bool:
+        if not self.allowed_killzones:
+            return True
+        if self.current_killzone in self.allowed_killzones:
+            return True
+        return False
+
+    def _record_skip(self, reason: str):
+        self.last_skip_reason = reason
+    
+    def _effective_min_volatility(self) -> float:
+        if self.adaptive_min_volatility is not None:
+            return max(0.00001, self.adaptive_min_volatility)
+        return self.min_volatility * self.backtest_threshold_multiplier
+    
+    def _effective_min_atr(self) -> float:
+        if self.adaptive_min_atr is not None:
+            return max(0.1, self.adaptive_min_atr)
+        return self.min_atr_for_entry * self.backtest_threshold_multiplier
+    
+    def _news_effect(self, news_context: Optional[Dict]) -> Tuple[bool, float]:
+        if not news_context or not self.news_guard_enabled or self.news_mode == 'off':
+            return True, 1.0
+        
+        caution = news_context.get('trading_caution', False) or news_context.get('high_impact_upcoming', False)
+        high_impact = news_context.get('high_impact_count', 0)
+        sentiment = news_context.get('sentiment', 0.0) or 0.0
+        
+        if self.news_mode == 'block':
+            if caution or high_impact >= 1:
+                return False, 0.0
+            return True, 1.0
+        
+        # Penalize mode
+        penalty = self.news_penalty_factor
+        if caution:
+            penalty *= 1.5
+        if high_impact:
+            penalty *= min(2.0, 1.0 + high_impact * 0.5)
+        # sentiment >0 reduces penalty, negative increases
+        penalty *= max(0.5, 1.0 - sentiment)
+        
+        multiplier = max(0.1, 1.0 - penalty)
+        return True, multiplier
+    
+    def _direction_allowed(self, side: OrderSide) -> bool:
+        if self.directional_bias == 'both':
+            return True
+        if self.directional_bias == 'long_only' and side == OrderSide.BUY:
+            return True
+        if self.directional_bias == 'short_only' and side == OrderSide.SELL:
+            return True
+        return False
+    
+    def _apply_news_sentiment(self, signal: TradeSignal, news_context: Optional[Dict]) -> TradeSignal:
+        if not news_context or not self.news_guard_enabled or self.news_mode == 'off':
+            return signal
+        sentiment = news_context.get('sentiment')
+        if sentiment is None:
+            return signal
+        sentiment = max(-1.0, min(1.0, float(sentiment)))
+        adjustment = 1.0 + (sentiment * self.news_sentiment_scale)
+        signal.confidence = max(0.1, min(1.0, signal.confidence * adjustment))
+        return signal
+    
+    def _trend_allows_trade(self, prices: List[float]) -> bool:
+        if not prices or len(prices) < max(self.trend_filter_fast_period, self.trend_filter_slow_period):
+            return False
+        fast = pd.Series(prices).ewm(span=self.trend_filter_fast_period).mean().iloc[-1]
+        slow = pd.Series(prices).ewm(span=self.trend_filter_slow_period).mean().iloc[-1]
+        diff = (fast - slow) / slow
+        if abs(diff) < self.trend_filter_buffer:
+            return False
+        if diff > 0 and self.directional_bias == 'short_only':
+            return False
+        if diff < 0 and self.directional_bias == 'long_only':
+            return False
+        return True
+    
     def _generate_trade_signals(self, market_data: Dict[str, MarketData]) -> List[TradeSignal]:
         """Generate optimized trade signals with enhanced quality filters"""
+        self._set_current_timestamp(market_data)
         self._reset_daily_counters()
+        self.last_skip_reason = None
+        
+        # Update price history before evaluating filters
+        self._update_price_history(market_data)
+        
+        if not self._killzone_allows_trade():
+            self._record_skip('killzone_blocked')
+            logger.info("⏰ Skipping trade: killzone filter active")
+            return []
         
         # Check daily trade limit
         if self.daily_trade_count >= self.max_trades_per_day:
+            self._record_skip('daily_limit')
             return []
-        
-        # Update price history
-        self._update_price_history(market_data)
         
         trade_signals = []
         
         # Session filter
         if self.only_trade_london_ny and not self._is_london_or_ny_session():
+            self._record_skip('session_blocked')
             logger.info("⏰ Skipping trade: outside London/NY sessions")
             return []
         
         # Time between trades filter
         if not self._can_trade_now():
+            self._record_skip('trade_spacing')
             logger.info(f"⏰ Skipping trade: minimum {self.min_time_between_trades_minutes}min gap required")
             return []
         
         for instrument in self.instruments:
             if instrument not in market_data or len(self.price_history[instrument]) < 20:
+                self._record_skip('insufficient_history')
                 continue
             
             current_data = market_data[instrument]
             prices = self.price_history[instrument]
+            news_context = getattr(current_data, 'news_context', None)
+            allow_trade, news_multiplier = self._news_effect(news_context)
+            if not allow_trade:
+                self._record_skip('news_guard')
+                logger.info(f"📰 Skipping {instrument}: news guard active (mode={self.news_mode})")
+                continue
             
             # Spread filter
             spread = current_data.ask - current_data.bid
-            if spread > self.max_spread:
+            spread_limit = self.max_spread * self.backtest_spread_multiplier
+            if spread > spread_limit:
+                self._record_skip('spread')
                 logger.info(f"⏰ Skipping {instrument}: spread too wide ({spread:.3f})")
                 continue
             
             # Volatility filter
             recent_prices = prices[-self.volatility_lookback:]
             volatility = np.std(recent_prices) / np.mean(recent_prices)
-            if volatility < self.min_volatility:
+            min_volatility = self._effective_min_volatility()
+            if volatility < min_volatility:
+                self._record_skip('volatility')
                 logger.info(f"⏰ Skipping {instrument}: volatility too low ({volatility:.6f})")
                 continue
             
             # ATR filter
             atr = self._calculate_atr(prices)
-            if atr < self.min_atr_for_entry:
+            min_atr = self._effective_min_atr()
+            if atr < min_atr:
+                self._record_skip('atr')
                 logger.info(f"⏰ Skipping {instrument}: ATR too low ({atr:.2f})")
                 continue
             
             # Check for breakout
             is_breakout, breakout_direction = self._check_breakout(prices)
             if not is_breakout:
+                self._record_skip('no_breakout')
                 continue
             
             # Pullback requirement
             if self.require_pullback and not self._check_pullback_to_ema(prices):
+                self._record_skip('pullback')
                 logger.info(f"⏰ Waiting for pullback on {instrument}")
+                continue
+            
+            if self.trend_filter_enabled and not self._trend_allows_trade(prices):
+                self._record_skip('trend_filter')
+                logger.info(f"⏰ Trend filter blocked trade on {instrument}")
                 continue
             
             # Multiple confirmations check
             confirmations = 0
-            if volatility >= self.min_volatility:
+            if volatility >= self._effective_min_volatility():
                 confirmations += 1
-            if atr >= self.min_atr_for_entry:
+            if atr >= self._effective_min_atr():
                 confirmations += 1
             if spread <= self.max_spread:
                 confirmations += 1
             
             if confirmations < self.min_confirmations:
+                self._record_skip('confirmations')
                 continue
             
             # Generate trade signal
             if breakout_direction == 'BUY':
+                if not self._direction_allowed(OrderSide.BUY):
+                    continue
                 trade_signal = TradeSignal(
                     instrument=instrument,
                     side=OrderSide.BUY,
                     units=10,  # 0.1 lot for Gold
                     entry_price=current_data.ask,
-                    stop_loss=current_data.ask - (self.stop_loss_pips * 0.0001),
-                    take_profit=current_data.ask + (self.take_profit_pips * 0.0001),
+                    stop_loss=current_data.ask - (self.stop_loss_pips * self.pip_size),
+                    take_profit=current_data.ask + (self.take_profit_pips * self.pip_size),
                     confidence=min(1.0, volatility * 10),  # Scale volatility to confidence
                     strength=min(1.0, atr / 5.0),  # Scale ATR to strength
                     timestamp=datetime.now(),
                     strategy_name=self.name
                 )
+                trade_signal = self._apply_news_sentiment(trade_signal, news_context)
+                trade_signal.confidence = max(0.1, min(1.0, trade_signal.confidence * news_multiplier))
                 trade_signals.append(trade_signal)
+                self.last_skip_reason = None
                 logger.info(f"✅ BUY signal generated for {instrument}: volatility={volatility:.6f}, ATR={atr:.2f}")
             
             elif breakout_direction == 'SELL':
+                if not self._direction_allowed(OrderSide.SELL):
+                    continue
                 trade_signal = TradeSignal(
                     instrument=instrument,
                     side=OrderSide.SELL,
                     units=10,  # 0.1 lot for Gold
                     entry_price=current_data.bid,
-                    stop_loss=current_data.bid + (self.stop_loss_pips * 0.0001),
-                    take_profit=current_data.bid - (self.take_profit_pips * 0.0001),
+                    stop_loss=current_data.bid + (self.stop_loss_pips * self.pip_size),
+                    take_profit=current_data.bid - (self.take_profit_pips * self.pip_size),
                     confidence=min(1.0, volatility * 10),  # Scale volatility to confidence
                     strength=min(1.0, atr / 5.0),  # Scale ATR to strength
                     timestamp=datetime.now(),
                     strategy_name=self.name
                 )
+                trade_signal = self._apply_news_sentiment(trade_signal, news_context)
+                trade_signal.confidence = max(0.1, min(1.0, trade_signal.confidence * news_multiplier))
                 trade_signals.append(trade_signal)
+                self.last_skip_reason = None
                 logger.info(f"✅ SELL signal generated for {instrument}: volatility={volatility:.6f}, ATR={atr:.2f}")
         
         # Quality filtering and ranking

@@ -19,6 +19,7 @@ import yaml
 import logging
 import json
 from datetime import datetime, timedelta
+from collections import Counter
 import pytz
 from typing import Dict, List, Any, Optional
 
@@ -261,6 +262,8 @@ def run_backtest(strategy, historical_data, days=14):
     logger.info(f"  Starting backtest at timestamp {start_idx}/{total_timestamps}")
     
     # Process each timestamp
+    skip_reasons = Counter()
+
     for i, timestamp in enumerate(sorted_timestamps[start_idx:], start=start_idx):
         if i % 1000 == 0 or i == start_idx:
             logger.info(f"  Progress: {i}/{total_timestamps} timestamps ({i*100//total_timestamps}%)")
@@ -280,6 +283,9 @@ def run_backtest(strategy, historical_data, days=14):
         # Generate signals
         try:
             signals = strategy.analyze_market(market_data_dict)
+            reason = getattr(strategy, 'last_skip_reason', None)
+            if reason:
+                skip_reasons[reason] += 1
             
             # Process new signals
             if signals:
@@ -423,7 +429,7 @@ def run_backtest(strategy, historical_data, days=14):
     logger.info(f"Status: {status}")
     logger.info(f"{'='*70}\n")
     
-    return {
+    result = {
         'strategy': strategy.name,
         'trades': total_trades,
         'wins': wins,
@@ -436,6 +442,15 @@ def run_backtest(strategy, historical_data, days=14):
         'status': status,
         'trade_details': trades
     }
+
+    if skip_reasons:
+        top_reasons = skip_reasons.most_common(5)
+        logger.info("🚫 Top skip reasons:")
+        for reason, count in top_reasons:
+            logger.info(f"   - {reason}: {count} occurrences")
+        result['skip_reasons'] = dict(skip_reasons)
+    
+    return result
 
 def run_backtest_for_strategies(strategies, days=14):
     """Run backtest for multiple strategies"""
